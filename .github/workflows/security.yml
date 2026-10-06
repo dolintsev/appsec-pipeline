@@ -56,12 +56,9 @@ jobs:
           path: sbom.cdx.json
 
       - name: Trivy — проверить SBOM на уязвимости
-        uses: aquasecurity/trivy-action@0.28.0
-        with:
-          scan-type: sbom
-          scan-ref: sbom.cdx.json
-          format: sarif
-          output: trivy-sbom.sarif
+        run: |
+          docker run --rm -v "$PWD":/work -w /work aquasec/trivy:latest \
+            sbom --format sarif --output trivy-sbom.sarif sbom.cdx.json
 
       - name: Отправить SARIF (библиотеки)
         if: always()
@@ -71,12 +68,9 @@ jobs:
           category: trivy-sbom
 
       - name: Trivy — проверить Dockerfile
-        uses: aquasecurity/trivy-action@0.28.0
-        with:
-          scan-type: config
-          scan-ref: app
-          format: sarif
-          output: trivy-config.sarif
+        run: |
+          docker run --rm -v "$PWD":/work -w /work aquasec/trivy:latest \
+            config --format sarif --output trivy-config.sarif app
 
       - name: Отправить SARIF (Dockerfile)
         if: always()
