@@ -9,6 +9,7 @@ permissions:
   security-events: write
 
 jobs:
+  # ---------- SAST: проверка кода ----------
   semgrep:
     runs-on: ubuntu-latest
     steps:
@@ -32,4 +33,55 @@ jobs:
         with:
           sarif_file: semgrep.sarif
           category: semgrep
+
+  # ---------- SCA: библиотеки и Dockerfile ----------
+  sca:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Скачать код репозитория
+        uses: actions/checkout@v4
+
+      - name: Syft — составить SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: ./app
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+          upload-artifact: false
+
+      - name: Сохранить SBOM как артефакт
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.cdx.json
+
+      - name: Trivy — проверить SBOM на уязвимости
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: sbom
+          scan-ref: sbom.cdx.json
+          format: sarif
+          output: trivy-sbom.sarif
+
+      - name: Отправить SARIF (библиотеки)
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-sbom.sarif
+          category: trivy-sbom
+
+      - name: Trivy — проверить Dockerfile
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: config
+          scan-ref: app
+          format: sarif
+          output: trivy-config.sarif
+
+      - name: Отправить SARIF (Dockerfile)
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-config.sarif
+          category: trivy-config
 
