@@ -1,0 +1,25 @@
+id: flask-debug-endpoint-exposure
+
+info:
+  name: Exposed debug endpoint with secrets
+  author: danil
+  severity: high
+  description: Страница /debug отдаёт секретный ключ и пароль администратора без авторизации
+  tags: exposure,debug,secrets
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/debug"
+
+    matchers-condition: and
+    matchers:
+      - type: status
+        status:
+          - 200
+      - type: word
+        part: body
+        words:
+          - "secret_key"
+          - "admin_password"
+        condition: and

@@ -79,3 +79,82 @@ jobs:
           sarif_file: trivy-config.sarif
           category: trivy-config
 
+  # ---------- Образ и DAST: проверка работающего приложения ----------
+  dast:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Скачать код репозитория
+        uses: actions/checkout@v4
+
+      - name: Собрать Docker-образ приложения
+        run: docker build -t vuln-shop:ci app
+
+      - name: Trivy — проверить готовый образ
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$PWD":/work -w /work aquasec/trivy:latest \
+            image --format sarif --output trivy-image.sarif vuln-shop:ci
+
+      - name: Отправить SARIF (образ)
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+      - name: Запустить приложение
+        run: docker run -d --name vuln-shop -p 5000:5000 vuln-shop:ci
+
+      - name: Ждём, пока приложение загрузится
+        run: |
+          for i in $(seq 1 30); do
+            curl -s http://localhost:5000 > /dev/null && echo "Приложение готово" && break
+            sleep 2
+          done
+
+      - name: Nuclei — проверка по шаблонам
+        continue-on-error: true
+        run: |
+          docker run --rm --network host \
+            -v "$PWD":/work -w /work projectdiscovery/nuclei:latest \
+            -u http://localhost:5000 -t nuclei/ -nc -jsonl -o nuclei.jsonl
+
+      - name: Dastardly — обход и атаки
+        continue-on-error: true
+        run: |
+          docker run --rm --network host --user $(id -u) \
+            -v "$PWD":/dastardly \
+            -e BURP_START_URL=http://localhost:5000/ \
+            -e BURP_REPORT_FILE_PATH=/dastardly/dastardly-report.xml \
+            public.ecr.aws/portswigger/dastardly:latest
+
+      - name: Перевести отчёты Nuclei и Dastardly в SARIF
+        if: always()
+        run: |
+          python3 scripts/to_sarif.py nuclei nuclei.jsonl nuclei.sarif
+          python3 scripts/to_sarif.py dastardly dastardly-report.xml dastardly.sarif
+
+      - name: Отправить SARIF (Nuclei)
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: nuclei.sarif
+          category: nuclei
+
+      - name: Отправить SARIF (Dastardly)
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: dastardly.sarif
+          category: dastardly
+
+      - name: Сохранить исходные отчёты
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dast-reports
+          path: |
+            nuclei.jsonl
+            dastardly-report.xml
+          if-no-files-found: ignore
