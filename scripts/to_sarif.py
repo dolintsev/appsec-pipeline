@@ -5,6 +5,9 @@
   python3 scripts/to_sarif.py nuclei nuclei.jsonl nuclei.sarif
   python3 scripts/to_sarif.py dastardly dastardly-report.xml dastardly.sarif
 
+Если отчёта нет или он испорчен — скрипт падает с ошибкой (код 1), а не делает
+вид, что находок нет: «инструмент сломался» не должно выглядеть как «всё чисто».
+
 GitHub требует, чтобы каждая находка была привязана к файлу в репозитории.
 DAST-находки относятся к адресам (URL), поэтому привязываем их к app/app.py,
 а сам адрес пишем в текст находки.
@@ -55,6 +58,8 @@ def read_dastardly(path):
     Разбираем регулярными выражениями: в отчётах Dastardly бывают
     символы, на которых строгий XML-парсер падает."""
     text = open(path, encoding="utf-8", errors="replace").read()
+    if "<testsuite" not in text:
+        raise ValueError(f"{path} не похож на отчёт Dastardly (нет <testsuite>)")
     pattern = re.compile(
         r'<testcase name="([^"]+)">\s*<failure message="([^"]*)" type="(\w+)">'
         r"<!\[CDATA\[(.*?)\]\]>",
@@ -116,8 +121,11 @@ def main():
     try:
         findings = read_nuclei(src) if kind == "nuclei" else read_dastardly(src)
     except FileNotFoundError:
-        print(f"Файл {src} не найден — считаем, что находок нет")
-        findings = []
+        print(f"::error::Отчёт {src} не найден — инструмент не отработал")
+        sys.exit(1)
+    except (ValueError, json.JSONDecodeError) as e:
+        print(f"::error::Отчёт {src} испорчен: {e}")
+        sys.exit(1)
     sarif = to_sarif("Nuclei" if kind == "nuclei" else "Dastardly", findings)
     with open(dst, "w", encoding="utf-8") as f:
         json.dump(sarif, f, ensure_ascii=False, indent=2)

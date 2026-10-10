@@ -2,156 +2,185 @@ name: Security pipeline
 
 on:
   push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 3 * * *'   # каждую ночь в 03:00 UTC: новые CVE появляются без изменений в коде
   workflow_dispatch:
 
 permissions:
   contents: read
   security-events: write
 
+# Все образы и версии закреплены в одном месте (заполняет scripts/pin-versions.sh)
+env:
+  SEMGREP_VERSION: 1.180.0
+  SYFT_IMAGE: anchore/syft@sha256:3eb5379ba7b409c3f4069b686110527af0c47df993fa5c10d13e7cf34f49b1aa
+  TRIVY_IMAGE: aquasec/trivy@sha256:af6acf9a6b85dfe389a1941505c0ce9efef52a4719635e1a962f022a3d855daa
+  NUCLEI_IMAGE: projectdiscovery/nuclei@sha256:582d5546902e67052097cb2d07296c642d50a1afc5e44623cb038845df9a32eb
+  DASTARDLY_IMAGE: public.ecr.aws/portswigger/dastardly@sha256:d2a78619439e7e624d7f9b8c5da4c4015090d7140b3f09e43f0102bb77bae83f
+
 jobs:
-  # ---------- SAST: проверка кода ----------
+  # ---------- SAST ----------
   semgrep:
     runs-on: ubuntu-latest
     steps:
-      - name: Скачать код репозитория
-        uses: actions/checkout@v4
+      - name: Скачать код (вся история нужна для сравнения с базовым коммитом)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
 
-      - name: Установить Semgrep
-        run: pip install semgrep
+      - name: Установить Semgrep закреплённой версии
+        run: pip install "semgrep==${SEMGREP_VERSION}"
 
-      - name: Запустить Semgrep
+      - name: Гейт — только НОВЫЕ находки этого PR
+        if: github.event_name == 'pull_request'
         run: |
           semgrep scan \
-            --config p/python \
-            --config p/secrets \
-            --sarif --output semgrep.sarif \
+            --config p/python --config p/secrets \
+            --baseline-commit "${{ github.event.pull_request.base.sha }}" \
+            --error \
             app/
 
-      - name: Отправить SARIF во вкладку Security
-        if: always()
-        uses: github/codeql-action/upload-sarif@v3
+      - name: Полное сканирование → SARIF
+        if: ${{ !cancelled() }}
+        run: |
+          semgrep scan \
+            --config p/python --config p/secrets \
+            --sarif --output "${{ runner.temp }}/semgrep.sarif" \
+            app/
+
+      - name: Отправить SARIF
+        if: ${{ !cancelled() }}
+        uses: github/codeql-action/upload-sarif@9f759ee644a3e7c15c1390abf49868036c00067b # v3
         with:
-          sarif_file: semgrep.sarif
+          sarif_file: ${{ runner.temp }}/semgrep.sarif
           category: semgrep
 
-  # ---------- SCA: библиотеки и Dockerfile ----------
-  sca:
+  # ---------- Артефакт: образ → SBOM → Trivy ----------
+  image:
     runs-on: ubuntu-latest
     steps:
-      - name: Скачать код репозитория
-        uses: actions/checkout@v4
+      - name: Скачать код
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Syft — составить SBOM
-        uses: anchore/sbom-action@v0
-        with:
-          path: ./app
-          format: cyclonedx-json
-          output-file: sbom.cdx.json
-          upload-artifact: false
+      - name: Собрать образ (это и есть артефакт, который уедет в прод)
+        run: docker build -t vuln-shop:ci app
+
+      - name: Syft — SBOM по собранному образу
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$PWD":/work -w /work "$SYFT_IMAGE" \
+            docker:vuln-shop:ci -o cyclonedx-json=sbom.cdx.json
+          test -s sbom.cdx.json || { echo "::error::Syft не создал SBOM"; exit 1; }
 
       - name: Сохранить SBOM как артефакт
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: sbom
           path: sbom.cdx.json
 
-      - name: Trivy — проверить SBOM на уязвимости
+      - name: Trivy — уязвимости по SBOM → SARIF
         run: |
-          docker run --rm -v "$PWD":/work -w /work aquasec/trivy:latest \
+          docker run --rm -v "$PWD":/work -w /work "$TRIVY_IMAGE" \
             sbom --format sarif --output trivy-sbom.sarif sbom.cdx.json
 
-      - name: Отправить SARIF (библиотеки)
-        if: always()
-        uses: github/codeql-action/upload-sarif@v3
+      - name: Отправить SARIF (уязвимости)
+        uses: github/codeql-action/upload-sarif@9f759ee644a3e7c15c1390abf49868036c00067b # v3
         with:
           sarif_file: trivy-sbom.sarif
           category: trivy-sbom
 
-      - name: Trivy — проверить Dockerfile
+      - name: Trivy — ошибки конфигурации Dockerfile → SARIF
+        if: ${{ !cancelled() }}
         run: |
-          docker run --rm -v "$PWD":/work -w /work aquasec/trivy:latest \
+          docker run --rm -v "$PWD":/work -w /work "$TRIVY_IMAGE" \
             config --format sarif --output trivy-config.sarif app
 
       - name: Отправить SARIF (Dockerfile)
-        if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        if: ${{ !cancelled() }}
+        uses: github/codeql-action/upload-sarif@9f759ee644a3e7c15c1390abf49868036c00067b # v3
         with:
           sarif_file: trivy-config.sarif
           category: trivy-config
 
-  # ---------- Образ и DAST: проверка работающего приложения ----------
+      - name: Гейт — новые CRITICAL/HIGH, для которых есть исправление
+        if: ${{ !cancelled() }}
+        run: |
+          docker run --rm -v "$PWD":/work -w /work "$TRIVY_IMAGE" \
+            sbom --severity CRITICAL,HIGH --ignore-unfixed \
+            --ignorefile security/trivy-accepted.txt \
+            --exit-code 1 sbom.cdx.json
+
+  # ---------- DAST: работающее приложение ----------
   dast:
     runs-on: ubuntu-latest
     steps:
-      - name: Скачать код репозитория
-        uses: actions/checkout@v4
+      - name: Скачать код
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Собрать Docker-образ приложения
-        run: docker build -t vuln-shop:ci app
-
-      - name: Trivy — проверить готовый образ
+      - name: Собрать и запустить приложение
         run: |
-          docker run --rm \
-            -v /var/run/docker.sock:/var/run/docker.sock \
-            -v "$PWD":/work -w /work aquasec/trivy:latest \
-            image --format sarif --output trivy-image.sarif vuln-shop:ci
+          docker build -t vuln-shop:ci app
+          docker run -d --name vuln-shop -p 5000:5000 vuln-shop:ci
 
-      - name: Отправить SARIF (образ)
-        if: always()
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: trivy-image.sarif
-          category: trivy-image
-
-      - name: Запустить приложение
-        run: docker run -d --name vuln-shop -p 5000:5000 vuln-shop:ci
-
-      - name: Ждём, пока приложение загрузится
+      - name: Дождаться приложения (не поднялось — красный)
         run: |
           for i in $(seq 1 30); do
-            curl -s http://localhost:5000 > /dev/null && echo "Приложение готово" && break
+            curl -sf http://localhost:5000 > /dev/null && break
             sleep 2
           done
+          curl -sf http://localhost:5000 > /dev/null || {
+            echo "::error::Приложение не запустилось"; docker logs vuln-shop; exit 1; }
 
       - name: Nuclei — проверка по шаблонам
-        continue-on-error: true
         run: |
-          docker run --rm --network host \
-            -v "$PWD":/work -w /work projectdiscovery/nuclei:latest \
-            -u http://localhost:5000 -t nuclei/ -nc -jsonl -o nuclei.jsonl
+          # Nuclei не создаёт файл, если ничего не нашёл. Пустой файл = «находок нет».
+          # Если сам Nuclei упадёт, он вернёт код ошибки и этот шаг станет красным.
+          touch nuclei.jsonl
+          docker run --rm --network host -v "$PWD":/work -w /work "$NUCLEI_IMAGE" \
+            -u http://localhost:5000 -t nuclei/ -duc -nc -jsonl -o nuclei.jsonl
 
       - name: Dastardly — обход и атаки
-        continue-on-error: true
         run: |
-          docker run --rm --network host --user $(id -u) \
+          # Dastardly возвращает ненулевой код и когда НАШЁЛ проблемы, и когда СЛОМАЛСЯ.
+          # Различаем по отчёту: нет отчёта = инструмент упал = красный.
+          set +e
+          docker run --rm --network host --user "$(id -u)" \
             -v "$PWD":/dastardly \
             -e BURP_START_URL=http://localhost:5000/ \
             -e BURP_REPORT_FILE_PATH=/dastardly/dastardly-report.xml \
-            public.ecr.aws/portswigger/dastardly:latest
+            "$DASTARDLY_IMAGE"
+          code=$?
+          set -e
+          if [ ! -s dastardly-report.xml ]; then
+            echo "::error::Dastardly не создал отчёт (код $code) — проверка не состоялась"
+            exit 1
+          fi
+          echo "Dastardly завершился с кодом $code, отчёт на месте"
 
-      - name: Перевести отчёты Nuclei и Dastardly в SARIF
-        if: always()
+      - name: Перевести отчёты в SARIF
         run: |
           python3 scripts/to_sarif.py nuclei nuclei.jsonl nuclei.sarif
           python3 scripts/to_sarif.py dastardly dastardly-report.xml dastardly.sarif
 
       - name: Отправить SARIF (Nuclei)
-        if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@9f759ee644a3e7c15c1390abf49868036c00067b # v3
         with:
           sarif_file: nuclei.sarif
           category: nuclei
 
       - name: Отправить SARIF (Dastardly)
-        if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@9f759ee644a3e7c15c1390abf49868036c00067b # v3
         with:
           sarif_file: dastardly.sarif
           category: dastardly
 
       - name: Сохранить исходные отчёты
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: dast-reports
           path: |
