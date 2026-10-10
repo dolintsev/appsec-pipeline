@@ -64,6 +64,12 @@ def debug():
     # Уязвимость: открытая отладочная страница с секретами (цель для Nuclei)
     return {"debug": True, "secret_key": app.config["SECRET_KEY"], "admin_password": ADMIN_PASSWORD}
 
+@app.route("/product")
+def product():
+    pid = request.args.get("id", "1")
+    conn = get_db()
+    rows = conn.execute("SELECT name FROM users WHERE id = " + pid).fetchall()
+    return {"rows": rows}
 
 if __name__ == "__main__":
     # Уязвимость: debug-режим Flask
