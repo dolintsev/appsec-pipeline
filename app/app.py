@@ -47,7 +47,7 @@ def user():
     user_id = request.args.get("id", "1")
     conn = get_db()
     # Уязвимость: SQL-инъекция — ввод склеивается в запрос
-    rows = conn.execute("SELECT name, email FROM users WHERE id = " + user_id).fetchall()
+    rows = conn.execute("SELECT name, email FROM users WHERE id = ?", (user_id,)).fetchall()
     return {"users": rows}
 
 
